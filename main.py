@@ -10,6 +10,7 @@ from aiohttp import ClientTimeout
 from aiohttp.client_exceptions import ClientError
 import asyncio
 from fastapi.responses import JSONResponse
+from datetime import datetime, timedelta
 
 # Enhanced logging
 logging.basicConfig(
@@ -17,6 +18,13 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Cache settings
+CACHE_DURATION = 30  # seconds
+token_cache = {
+    "data": None,
+    "last_updated": None
+}
 
 app = FastAPI(
     title="Pump.fun API Scraper",
@@ -45,17 +53,17 @@ headers = {
 
 # Define timeout and retry settings
 TIMEOUT = ClientTimeout(total=30, connect=10, sock_read=10)
-MAX_RETRIES = 3
-RETRY_DELAY = 1
+MAX_RETRIES = 5  # Increased from 3 to 5
+INITIAL_RETRY_DELAY = 1
 
 async def fetch_with_retry(session, url, params):
-    """Helper function to fetch data with retry logic"""
+    """Helper function to fetch data with exponential backoff retry logic"""
     for attempt in range(MAX_RETRIES):
         try:
             async with session.get(url, params=params, headers=headers, timeout=TIMEOUT) as response:
                 if response.status == 429:  # Rate limit
-                    retry_after = int(response.headers.get('Retry-After', RETRY_DELAY))
-                    logger.warning(f"Rate limited, waiting {retry_after} seconds")
+                    retry_after = int(response.headers.get('Retry-After', INITIAL_RETRY_DELAY * (2 ** attempt)))
+                    logger.warning(f"Rate limited, waiting {retry_after} seconds (attempt {attempt + 1}/{MAX_RETRIES})")
                     await asyncio.sleep(retry_after)
                     continue
                 
@@ -63,21 +71,32 @@ async def fetch_with_retry(session, url, params):
                 return await response.json()
                 
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout on attempt {attempt + 1}/{MAX_RETRIES}")
+            retry_delay = INITIAL_RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+            logger.warning(f"Timeout on attempt {attempt + 1}/{MAX_RETRIES}, waiting {retry_delay} seconds")
             if attempt == MAX_RETRIES - 1:
-                raise HTTPException(status_code=504, detail="Request timeout")
-            await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                raise HTTPException(status_code=504, detail="Request timeout after multiple retries")
+            await asyncio.sleep(retry_delay)
             
         except ClientError as e:
+            retry_delay = INITIAL_RETRY_DELAY * (2 ** attempt)  # Exponential backoff
             logger.error(f"Network error on attempt {attempt + 1}/{MAX_RETRIES}: {str(e)}")
             if attempt == MAX_RETRIES - 1:
-                raise HTTPException(status_code=502, detail="Network error")
-            await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                raise HTTPException(status_code=502, detail="Network error after multiple retries")
+            await asyncio.sleep(retry_delay)
     
     raise HTTPException(status_code=500, detail="Max retries exceeded")
 
-async def fetch_tokens(limit: int = 100):
-    """Fetch tokens directly from pump.fun API"""
+async def fetch_tokens(limit: int = 100, force_refresh: bool = False):
+    """Fetch tokens with caching"""
+    current_time = datetime.now()
+    
+    # Return cached data if available and not expired
+    if not force_refresh and token_cache["data"] is not None:
+        cache_age = (current_time - token_cache["last_updated"]).total_seconds()
+        if cache_age < CACHE_DURATION:
+            logger.info("Returning cached token data")
+            return token_cache["data"][:limit]
+    
     connector = aiohttp.TCPConnector(limit=10, force_close=True)
     
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -119,32 +138,38 @@ async def fetch_tokens(limit: int = 100):
             
             logger.info(f"Received total of {len(all_tokens)} tokens from API")
             
-            # Process and return only the requested number of tokens
-            tokens = all_tokens[:limit]
-            return [
+            # Process tokens
+            processed_tokens = [
                 {
                     "name": token.get("name", "").strip(),
+                    "price": round(float(token.get("usd_market_cap", 0)) / 1_000_000_000, 8),
                     "market_cap": round(float(token.get("usd_market_cap", 0))),
                     "description": token.get("description", ""),
                     "replies": token.get("reply_count", 0),
                     "image_url": token.get("image_uri", ""),
                     "token_url": f"https://pump.fun/board/{token.get('mint', '')}"
                 }
-                for token in tokens
+                for token in all_tokens
             ]
+            
+            # Update cache
+            token_cache["data"] = processed_tokens
+            token_cache["last_updated"] = current_time
+            
+            return processed_tokens[:limit]
             
         except Exception as e:
             logger.error(f"Error fetching tokens: {str(e)}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/tokens")
-async def get_tokens(limit: Optional[int] = 100):
+async def get_tokens(limit: Optional[int] = 100, force_refresh: Optional[bool] = False):
     """Get list of top tokens from pump.fun, sorted by market cap"""
     try:
         if not 1 <= limit <= 1000:
             raise HTTPException(status_code=400, detail="Limit must be between 1 and 1000")
             
-        tokens = await fetch_tokens(limit)
+        tokens = await fetch_tokens(limit, force_refresh)
         return JSONResponse(content=tokens)
         
     except HTTPException:
