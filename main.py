@@ -45,14 +45,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_URL = "https://frontend-api.pump.fun"
+# Replace the API_URL with direct website URLs
+# API_URL = "https://frontend-api.pump.fun"
+WEBSITE_URL = "https://pump.fun"
 
-# Define headers globally
+# Define headers globally with more browser-like headers to avoid being blocked
 headers = {
-    "Accept": "application/json",
-    "Origin": "https://pump.fun",
-    "Referer": "https://pump.fun/",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0"
 }
 
 # Define timeout and retry settings
@@ -110,7 +115,7 @@ async def fetch_with_retry(session, url, params):
     return None  # Return None if all attempts failed
 
 async def fetch_tokens(limit: int = 100, force_refresh: bool = False):
-    """Fetch tokens with caching"""
+    """Fetch tokens by scraping pump.fun website directly"""
     current_time = datetime.now()
     
     # Return cached data if available and not expired
@@ -120,105 +125,107 @@ async def fetch_tokens(limit: int = 100, force_refresh: bool = False):
             logger.info("Returning cached token data")
             return token_cache["data"][:limit]
     
-    connector = aiohttp.TCPConnector(limit=10, force_close=True)
-    
-    async with aiohttp.ClientSession(connector=connector) as session:
-        try:
-            all_tokens = []
-            offset = 0
-            batch_size = 50
-            api_success = False
-            
-            while len(all_tokens) < limit:
-                url = f"{API_URL}/coins"
-                params = {
-                    "offset": str(offset),
-                    "limit": "50",
-                    "sort": "market_cap",
-                    "order": "DESC",
-                    "includeNsfw": "false"
-                }
-                
-                logger.info(f"Fetching tokens from API: {url} (offset: {offset})")
-                
-                try:
-                    batch = await fetch_with_retry(session, url, params)
-                    
-                    if batch is None:
-                        logger.error(f"Failed to fetch tokens after {MAX_RETRIES} retries")
-                        break
-                    
-                    if not batch or len(batch) == 0:
-                        logger.info("No more tokens available")
-                        api_success = True
-                        break
-                    
-                    logger.info(f"Received {len(batch)} tokens in current batch")
-                    all_tokens.extend(batch)
-                    api_success = True
-                    
-                    if len(all_tokens) >= limit or len(batch) < 50:
-                        break
-                    
-                    offset += 50
-                    
-                except Exception as e:
-                    logger.error(f"Error in batch fetch: {str(e)}")
-                    break
-            
-            # If API fetch failed and we have cached data, use that instead
-            if not api_success and token_cache["data"] is not None:
-                logger.info("API fetch failed, using cached data")
-                
-                # Check if cached data is too old (beyond fallback duration)
-                cache_age = (current_time - token_cache["last_updated"]).total_seconds()
-                if cache_age > CACHE_FALLBACK_DURATION:
-                    logger.warning(f"Cached data is too old ({cache_age} seconds), but using anyway as fallback")
-                    
-                return token_cache["data"][:limit]
-            
-            # If API fetch failed and we have no cached data
-            if len(all_tokens) == 0:
-                logger.error("Failed to fetch tokens and no cache available")
-                raise HTTPException(status_code=503, detail="Service unavailable - please try again later")
-            
-            logger.info(f"Received total of {len(all_tokens)} tokens from API")
-            
-            # Process tokens
-            processed_tokens = [
-                {
-                    "name": token.get("name", "").strip(),
-                    "price": round(float(token.get("usd_market_cap", 0)) / 1_000_000_000, 8),
-                    "market_cap": round(float(token.get("usd_market_cap", 0))),
-                    "description": token.get("description", ""),
-                    "replies": token.get("reply_count", 0),
-                    "image_url": token.get("image_uri", ""),
-                    "token_url": f"https://pump.fun/board/{token.get('mint', '')}"
-                }
-                for token in all_tokens
-            ]
-            
-            # Update cache
-            token_cache["data"] = processed_tokens
-            token_cache["last_updated"] = current_time
-            
-            return processed_tokens[:limit]
-            
-        except Exception as e:
-            logger.error(f"Error fetching tokens: {str(e)}\n{traceback.format_exc()}")
-            
-            # Fallback to cached data if available
+    try:
+        logger.info(f"Scraping tokens from pump.fun website")
+        
+        # Use direct HTTP request instead of aiohttp for better compatibility with some sites
+        url = f"{WEBSITE_URL}/board"
+        response = requests.get(url, headers=headers, timeout=30)
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch tokens, status code: {response.status_code}")
+            # Try to use cached data as fallback
             if token_cache["data"] is not None:
-                logger.info("Using cached data as fallback due to error")
-                
-                # Check if cached data is too old (beyond fallback duration)
                 cache_age = (current_time - token_cache["last_updated"]).total_seconds()
                 if cache_age > CACHE_FALLBACK_DURATION:
                     logger.warning(f"Cached data is too old ({cache_age} seconds), but using anyway as fallback")
-                    
+                logger.info("Using cached data as fallback")
                 return token_cache["data"][:limit]
+            else:
+                raise HTTPException(status_code=503, detail="Service unavailable - please try again later")
+        
+        # Parse the HTML
+        soup = BeautifulSoup(response.text, 'lxml')
+        
+        # Find the token list (this will need to be updated based on actual HTML structure)
+        tokens_data = []
+        token_elements = soup.select('.token-list-item, .token-card, [data-token-address]')
+        
+        logger.info(f"Found {len(token_elements)} token elements on the page")
+        
+        for element in token_elements[:limit]:  # Only process up to the limit
+            try:
+                # Extract token data based on HTML structure
+                token_address = element.get('data-token-address') or element.get('href', '').split('/')[-1]
                 
-            raise HTTPException(status_code=503, detail="Service unavailable - please try again later")
+                if not token_address or token_address == '#':
+                    continue
+                
+                # Get token name
+                name_elem = element.select_one('.token-name, h3, .name')
+                name = name_elem.text.strip() if name_elem else token_address
+                
+                # Try to find market cap
+                market_cap_elem = element.select_one('.market-cap, .cap')
+                market_cap = 0
+                if market_cap_elem:
+                    market_cap_text = market_cap_elem.text.strip()
+                    # Extract just the numeric part, removing $, commas, etc.
+                    market_cap_text = re.sub(r'[^\d.]', '', market_cap_text)
+                    try:
+                        market_cap = float(market_cap_text)
+                    except ValueError:
+                        pass
+                
+                # Calculate price (1 billion supply)
+                price = round(market_cap / 1_000_000_000, 8) if market_cap > 0 else 0
+                
+                # Get image URL
+                img_elem = element.select_one('img')
+                image_url = img_elem['src'] if img_elem and 'src' in img_elem.attrs else ""
+                
+                # Get description if available
+                desc_elem = element.select_one('.description, .token-description')
+                description = desc_elem.text.strip() if desc_elem else ""
+                
+                tokens_data.append({
+                    "name": name,
+                    "price": price,
+                    "market_cap": market_cap,
+                    "description": description,
+                    "image_url": image_url,
+                    "token_url": f"{WEBSITE_URL}/board/{token_address}",
+                    "mint": token_address,
+                    "supply": "1,000,000,000",
+                    "replies": 0  # We don't have this information from scraping
+                })
+            except Exception as e:
+                logger.error(f"Error processing token element: {str(e)}")
+                continue
+        
+        logger.info(f"Successfully scraped {len(tokens_data)} tokens")
+        
+        # Update cache
+        token_cache["data"] = tokens_data
+        token_cache["last_updated"] = current_time
+        
+        return tokens_data[:limit]
+        
+    except Exception as e:
+        logger.error(f"Error fetching tokens: {str(e)}\n{traceback.format_exc()}")
+        
+        # Fallback to cached data if available
+        if token_cache["data"] is not None:
+            logger.info("Using cached data as fallback due to error")
+            
+            # Check if cached data is too old (beyond fallback duration)
+            cache_age = (current_time - token_cache["last_updated"]).total_seconds()
+            if cache_age > CACHE_FALLBACK_DURATION:
+                logger.warning(f"Cached data is too old ({cache_age} seconds), but using anyway as fallback")
+                
+            return token_cache["data"][:limit]
+                
+        raise HTTPException(status_code=503, detail="Service unavailable - please try again later")
 
 @app.get("/tokens")
 async def get_tokens(limit: Optional[int] = 100, force_refresh: Optional[bool] = False):
